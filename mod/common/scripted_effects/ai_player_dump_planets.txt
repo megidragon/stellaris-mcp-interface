@@ -5,10 +5,6 @@ ai_player_dump_planets = {
 	every_owned_planet = {
 		export_trigger_value_to_variable = {
 			trigger = count_owned_pop_amount
-			parameters = {
-				count = all
-				limit = { }
-			}
 			variable = ai_pl_pops
 		}
 		export_trigger_value_to_variable = {
@@ -52,6 +48,6 @@ ai_player_dump_planets = {
 			variable = ai_pl_districts
 		}
 
-		log = "AI_PLANET|\\[This.GetName]|\\[This.GetPlanetClassName]|\\[This.ai_pl_pops]|\\[This.ai_pl_size]|\\[This.ai_pl_stability]|\\[This.ai_pl_amenities]|\\[This.ai_pl_free_housing]|\\[This.ai_pl_free_jobs]|\\[This.ai_pl_crime]|\\[This.ai_pl_buildings]|\\[This.ai_pl_districts]"
+		log = "AI_PLANET|\\[This.GetName]|\\[This.GetClassName]|\\[This.ai_pl_pops]|\\[This.ai_pl_size]|\\[This.ai_pl_stability]|\\[This.ai_pl_amenities]|\\[This.ai_pl_free_housing]|\\[This.ai_pl_free_jobs]|\\[This.ai_pl_crime]|\\[This.ai_pl_buildings]|\\[This.ai_pl_districts]"
 	}
 }

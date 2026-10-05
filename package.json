@@ -7,11 +7,16 @@
   "bin": {
     "stellaris-mcp": "dist/index.js"
   },
+  "engines": {
+    "node": ">=20.19.0"
+  },
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
-    "test:parser": "tsx src/parser/test-parser.ts"
+    "test:parser": "tsx src/parser/test-parser.ts",
+    "test": "npm run build && tsx --test tests/*.test.ts",
+    "diagnose": "node dist/diagnose.js"
   },
   "keywords": ["stellaris", "mcp", "ai"],
   "author": "",

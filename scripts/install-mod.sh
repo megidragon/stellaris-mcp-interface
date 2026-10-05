@@ -25,7 +25,7 @@ path="$MOD_DIR"
 tags={
 	"Utilities"
 }
-supported_version="4.3.*"
+supported_version="4.5.*"
 EOF
 
 echo ""

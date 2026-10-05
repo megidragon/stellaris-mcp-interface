@@ -14,7 +14,7 @@ country_event = {
 
 	immediate = {
 		set_country_flag = ai_player_active
-		log = "AI_INIT|\\[GetDate]|\\[This.GetName]|AI Player MCP Bridge initialized"
+		log = "AI_INIT|[GetDate]|[This.GetName]|AI Player MCP Bridge initialized"
 	}
 }
 
@@ -28,10 +28,16 @@ country_event = {
 
 	trigger = {
 		is_ai = no
-		has_country_flag = ai_player_active
 	}
 
 	immediate = {
+		# Existing saves do not fire on_game_start_country. Initialize lazily too.
+		if = {
+			limit = { NOT = { has_country_flag = ai_player_active } }
+			set_country_flag = ai_player_active
+			log = "AI_INIT|[GetDate]|[This.GetName]|AI Player MCP Bridge initialized"
+		}
+
 		# === SUMMARY ===
 		export_trigger_value_to_variable = {
 			trigger = num_owned_planets
@@ -39,10 +45,6 @@ country_event = {
 		}
 		export_trigger_value_to_variable = {
 			trigger = count_owned_pop_amount
-			parameters = {
-				count = all
-				limit = { }
-			}
 			variable = ai_num_pops
 		}
 		export_trigger_value_to_variable = {
@@ -58,7 +60,7 @@ country_event = {
 			variable = ai_mil_power
 		}
 
-		log = "AI_SUMMARY|\\[GetDate]|\\[This.GetName]|\\[This.ai_num_planets]|\\[This.ai_num_pops]|\\[This.ai_navy_used]|\\[This.ai_navy_cap]|\\[This.ai_mil_power]"
+		log = "AI_SUMMARY|[GetDate]|[This.GetName]|[This.ai_num_planets]|[This.ai_num_pops]|[This.ai_navy_used]|[This.ai_navy_cap]|[This.ai_mil_power]"
 
 		# === RESOURCES ===
 		ai_player_dump_resources = yes
@@ -76,6 +78,21 @@ country_event = {
 		ai_player_dump_tech = yes
 
 		# === END MARKER ===
-		log = "AI_STATE_END|\\[GetDate]"
+		log = "AI_STATE_END|[GetDate]"
+	}
+}
+
+# Global pulses also cover country types without has_pulse_events (e.g. Fallen
+# Empires). The country event resets Root to the player before exporting state.
+event = {
+	id = ai_player.2
+	hide_window = yes
+	is_triggered_only = yes
+
+	immediate = {
+		every_country = {
+			limit = { is_ai = no }
+			country_event = { id = ai_player.1 }
+		}
 	}
 }

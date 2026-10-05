@@ -1,7 +1,9 @@
 # Install the AI Player MCP mod to the Stellaris mod directory
 # Run from the project root: powershell -ExecutionPolicy Bypass -File scripts\install-mod.ps1
 
-$StellarisDocuments = Join-Path $env:USERPROFILE "Documents\Paradox Interactive\Stellaris"
+param(
+    [string]$StellarisDocuments = (Join-Path ([Environment]::GetFolderPath("MyDocuments")) "Paradox Interactive\Stellaris")
+)
 $ModName = "ai_player_mcp"
 $ModDir = Join-Path $StellarisDocuments "mod\$ModName"
 $ModDescriptor = Join-Path $StellarisDocuments "mod\$ModName.mod"
@@ -27,7 +29,7 @@ path="mod/$ModName"
 tags={
 	"Utilities"
 }
-supported_version="4.3.*"
+supported_version="4.5.*"
 "@ | Set-Content -Path $ModDescriptor -Encoding UTF8
 
 Write-Host "Mod installed successfully!" -ForegroundColor Green

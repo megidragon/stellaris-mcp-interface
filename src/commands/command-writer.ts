@@ -1,32 +1,33 @@
-import { writeFile, readFile } from "fs/promises";
-import { join } from "path";
+import { writeFile, readFile, rename, unlink } from "node:fs/promises";
+import { basename, join } from "node:path";
+import { randomUUID } from "node:crypto";
 
 /**
- * Writes console commands to a file that Stellaris can execute via `run ai_commands.txt`
+ * Writes each batch to its own file, executed manually with the returned `run` command.
  *
  * The file is placed in the Stellaris documents root directory.
- * The player (or automation) must type `run ai_commands.txt` in the console to execute.
+ * The file is not an execution acknowledgement; rerunning a batch repeats its actions.
  */
 export class CommandWriter {
-  private commandFile: string;
-  private pendingCommands: string[] = [];
+  private commandFile: string | null = null;
+  private pendingCommands: { command: string }[] = [];
+  private flushChain: Promise<void> = Promise.resolve();
 
   constructor(private stellarisDocumentsPath: string) {
-    this.commandFile = join(stellarisDocumentsPath, "ai_commands.txt");
   }
 
   /**
    * Queue a raw console command
    */
   queueCommand(command: string): void {
-    this.pendingCommands.push(command);
+    this.pendingCommands.push({ command });
   }
 
   /**
    * Queue an effect command (wraps in `effect { ... }`)
    */
   queueEffect(effect: string): void {
-    this.pendingCommands.push(`effect ${effect}`);
+    this.queueCommand(`effect ${effect}`);
   }
 
   /**
@@ -83,24 +84,39 @@ export class CommandWriter {
    * Write all pending commands to the file and clear the queue
    */
   async flush(): Promise<string> {
+    const result = this.flushChain.then(() => this.flushBatch());
+    this.flushChain = result.then(() => undefined, () => undefined);
+    return result;
+  }
+
+  private async flushBatch(): Promise<string> {
     if (this.pendingCommands.length === 0) {
       return "No pending commands";
     }
 
-    const content = this.pendingCommands.join("\n") + "\n";
-    await writeFile(this.commandFile, content, "utf-8");
-
-    const count = this.pendingCommands.length;
-    this.pendingCommands = [];
-
-    return `Wrote ${count} commands to ${this.commandFile}. Execute in Stellaris console: run ai_commands.txt`;
+    const batch = [...this.pendingCommands];
+    const commandFile = join(this.stellarisDocumentsPath, `ai_commands_${randomUUID()}.txt`);
+    const temporaryFile = `${commandFile}.tmp`;
+    const content = batch.map(({ command }) => command).join("\n") + "\n";
+    try {
+      await writeFile(temporaryFile, content, { encoding: "utf-8", flag: "wx" });
+      await rename(temporaryFile, commandFile);
+    } catch (error) {
+      await unlink(temporaryFile).catch(() => undefined);
+      // Keep the batch queued for a retry; no partial final file is visible.
+      throw new Error(`Cannot write Stellaris command batch to ${commandFile}`, { cause: error });
+    }
+    const written = new Set(batch);
+    this.pendingCommands = this.pendingCommands.filter((entry) => !written.has(entry));
+    this.commandFile = commandFile;
+    return `Wrote ${batch.length} commands to ${commandFile}. Execute in Stellaris console: run ${basename(commandFile)}. This file has not been executed automatically.`;
   }
 
   /**
    * Read current pending commands
    */
   getPendingCommands(): string[] {
-    return [...this.pendingCommands];
+    return this.pendingCommands.map(({ command }) => command);
   }
 
   /**
@@ -114,6 +130,7 @@ export class CommandWriter {
    * Read the current command file content
    */
   async readCommandFile(): Promise<string> {
+    if (!this.commandFile) return "";
     try {
       return await readFile(this.commandFile, "utf-8");
     } catch {

@@ -5,6 +5,12 @@ export interface GameState {
   countries: Country[];
   wars: War[];
   timestamp: string;
+  diagnostics?: {
+    source: "save";
+    warnings: string[];
+    missingFields: string[];
+    savePath?: string;
+  };
 }
 
 export interface GameMeta {
@@ -34,6 +40,7 @@ export interface PlayerState {
 }
 
 export interface Resources {
+  [key: string]: number;
   energy: number;
   minerals: number;
   food: number;
@@ -54,7 +61,7 @@ export interface Resources {
   engineering_research: number;
 }
 
-export const RESOURCE_KEYS: (keyof Resources)[] = [
+export const RESOURCE_KEYS: (keyof Resources & string)[] = [
   "energy",
   "minerals",
   "food",
@@ -169,15 +176,22 @@ export interface War {
 /** Log-parsed partial state (from mod output in game.log) */
 export interface LogGameState {
   date: string;
+  empireName?: string;
   resources?: Partial<Resources>;
   resourceIncome?: Partial<Resources>;
   planets?: Partial<Planet>[];
   fleets?: Partial<Fleet>[];
   diplomacy?: Partial<Country>[];
+  researchOutput?: {
+    physics: number;
+    society: number;
+    engineering: number;
+  };
   summary?: {
     numPlanets: number;
     numPops: number;
     navyCap: number;
+    navySize?: number;
     fleetPower: number;
   };
 }

@@ -1,162 +1,109 @@
-import { readFile } from "fs/promises";
-import type { LogGameState, Resources } from "./types.js";
-import { RESOURCE_KEYS } from "./types.js";
+import { readFile } from "node:fs/promises";
+import type { LogGameState } from "./types.js";
 
-const AI_PREFIX = "AI_";
-const STATE_END_MARKER = "AI_STATE_END";
-
-/**
- * Parse the game.log file for AI_* prefixed lines from the mod.
- * Returns the latest complete state dump.
- */
-export async function parseGameLog(
-  logPath: string
-): Promise<LogGameState | null> {
+/** Return the latest complete monthly report; never combine separate dumps. */
+export async function parseGameLog(logPath: string): Promise<LogGameState | null> {
   try {
-    const content = await readFile(logPath, "utf-8");
-    return parseLogContent(content);
-  } catch {
-    return null;
+    return parseLogContent(await readFile(logPath, "utf-8"));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
   }
 }
 
 export function parseLogContent(content: string): LogGameState | null {
-  const lines = content.split("\n");
+  let latest: LogGameState | null = null;
+  let pending: LogGameState | null = null;
 
-  // Find the last complete state dump (between last AI_SUMMARY and AI_STATE_END)
-  let lastEndIdx = -1;
-  for (let i = lines.length - 1; i >= 0; i--) {
-    if (lines[i].includes(STATE_END_MARKER)) {
-      lastEndIdx = i;
-      break;
+  for (const line of content.split("\n")) {
+    const record = extractAiLine(line);
+    if (!record) continue;
+    const { type, fields } = record;
+    if (type === "AI_INIT") {
+      latest = null;
+      pending = null;
+      continue;
     }
-  }
-
-  if (lastEndIdx === -1) return null;
-
-  // Find the start of this dump (AI_SUMMARY before the end)
-  let startIdx = -1;
-  for (let i = lastEndIdx - 1; i >= 0; i--) {
-    if (lines[i].includes("AI_SUMMARY|")) {
-      startIdx = i;
-      break;
+    if (type === "AI_SUMMARY") {
+      pending = null;
+      if (!/^\d+\.\d{2}\.\d{2}$/.test(fields[0] ?? "")) continue;
+      const counts = fields.slice(2, 7).map(number);
+      if (counts.length !== 5 || counts.some((value) => value === undefined)) continue;
+      const [numPlanets, numPops, navySize, navyCap, fleetPower] = counts as number[];
+      pending = {
+        date: fields[0],
+        empireName: fields[1],
+        summary: { numPlanets, numPops, navySize, navyCap, fleetPower },
+      };
+      continue;
     }
-  }
-
-  if (startIdx === -1) {
-    // Try to find any AI_ lines before the end
-    for (let i = lastEndIdx - 1; i >= 0; i--) {
-      if (!lines[i].includes(AI_PREFIX)) {
-        startIdx = i + 1;
+    if (!pending) continue;
+    if (type === "AI_STATE_END") {
+      if (fields[0] === pending.date) latest = pending;
+      pending = null;
+      continue;
+    }
+    switch (type) {
+      case "AI_RESOURCES": {
+        if (fields[0] !== pending.date) break;
+        const stockpile = number(fields[2]);
+        const income = number(fields[3]);
+        // Resource IDs are extensible so total conversions can report their IDs.
+        if (fields[1] && stockpile !== undefined) (pending.resources ??= {})[fields[1]] = stockpile;
+        if (fields[1] && income !== undefined) (pending.resourceIncome ??= {})[fields[1]] = income;
         break;
       }
-    }
-  }
-
-  if (startIdx === -1) startIdx = 0;
-
-  // Parse all AI_ lines in this block
-  const state: LogGameState = { date: "" };
-  const resources: Partial<Resources> = {};
-  const income: Partial<Resources> = {};
-  const planets: any[] = [];
-  const fleets: any[] = [];
-  const diplomacy: any[] = [];
-
-  for (let i = startIdx; i <= lastEndIdx; i++) {
-    const line = lines[i];
-    const aiMatch = extractAiLine(line);
-    if (!aiMatch) continue;
-
-    const { type, fields } = aiMatch;
-
-    switch (type) {
-      case "AI_SUMMARY":
-        state.date = fields[0] || "";
-        state.summary = {
-          numPlanets: num(fields[2]),
-          numPops: num(fields[3]),
-          navyCap: num(fields[4]),
-          fleetPower: num(fields[5]),
-        };
+      case "AI_PLANET":
+        (pending.planets ??= []).push({
+          name: fields[0], planetClass: fields[1],
+          pops: number(fields[2]), size: number(fields[3]),
+          stability: number(fields[4]), amenities: number(fields[5]),
+          freeHousing: number(fields[6]), freeJobs: number(fields[7]), crime: number(fields[8]),
+        });
         break;
-
-      case "AI_RESOURCES": {
-        const resName = fields[1] as keyof Resources;
-        if (RESOURCE_KEYS.includes(resName)) {
-          resources[resName] = num(fields[2]);
-          income[resName] = num(fields[3]);
+      case "AI_FLEET":
+        (pending.fleets ??= []).push({
+          name: fields[0], ships: number(fields[1]), militaryPower: number(fields[2]), mia: boolean(fields[3]),
+        });
+        break;
+      case "AI_DIPLO":
+        (pending.diplomacy ??= []).push({
+          name: fields[0], opinion: number(fields[1]), isRival: boolean(fields[2]),
+          hasDefensivePact: boolean(fields[3]), isAtWar: boolean(fields[4]),
+        });
+        break;
+      case "AI_TECH_OUTPUT": {
+        if (fields[0] !== pending.date) break;
+        const physics = number(fields[1]);
+        const society = number(fields[2]);
+        const engineering = number(fields[3]);
+        if (physics !== undefined && society !== undefined && engineering !== undefined) {
+          pending.researchOutput = { physics, society, engineering };
         }
         break;
       }
-
-      case "AI_PLANET":
-        planets.push({
-          name: fields[0],
-          planetClass: fields[1],
-          pops: num(fields[2]),
-          size: num(fields[3]),
-          stability: num(fields[4]),
-          amenities: num(fields[5]),
-          freeHousing: num(fields[6]),
-          freeJobs: num(fields[7]),
-          crime: num(fields[8]),
-        });
-        break;
-
-      case "AI_FLEET":
-        fleets.push({
-          name: fields[0],
-          ships: num(fields[1]),
-          militaryPower: num(fields[2]),
-          mia: fields[3] === "yes",
-        });
-        break;
-
-      case "AI_DIPLO":
-        diplomacy.push({
-          name: fields[0],
-          opinion: num(fields[1]),
-          isRival: fields[2] === "yes",
-          hasDefensivePact: fields[3] === "yes",
-        });
-        break;
-
-      case "AI_TECH_OUTPUT":
-        // fields: physics|society|engineering
-        break;
     }
   }
-
-  if (Object.keys(resources).length > 0) state.resources = resources;
-  if (Object.keys(income).length > 0) state.resourceIncome = income;
-  if (planets.length > 0) state.planets = planets;
-  if (fleets.length > 0) state.fleets = fleets;
-  if (diplomacy.length > 0) state.diplomacy = diplomacy;
-
-  return state;
+  return latest;
 }
 
-function extractAiLine(
-  line: string
-): { type: string; fields: string[] } | null {
-  // Log lines from Stellaris look like: [HH:MM:SS] [game] AI_TYPE|field1|field2|...
-  // or just: AI_TYPE|field1|field2|...
-  const aiIdx = line.indexOf("AI_");
-  if (aiIdx === -1) return null;
-
-  const payload = line.substring(aiIdx);
-  const parts = payload.split("|");
-  if (parts.length < 2) return null;
-
-  return {
-    type: parts[0].trim(),
-    fields: parts.slice(1).map((s) => s.trim()),
-  };
+function extractAiLine(line: string): { type: string; fields: string[] } | null {
+  const match = /(?:^|\s)(AI_[A-Z_]+)\|(.+)$/.exec(line.trim());
+  if (!match) return null;
+  return { type: match[1], fields: match[2].split("|").map((field) => field.trim()) };
 }
 
-function num(val: string | undefined): number {
-  if (!val) return 0;
-  const n = parseFloat(val);
-  return isNaN(n) ? 0 : n;
+function number(value: string | undefined): number | undefined {
+  if (!value?.trim()) return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function boolean(value: string | undefined): boolean | undefined {
+  if (value === "yes") return true;
+  if (value === "no") return false;
+  const parsed = number(value);
+  if (parsed === 1) return true;
+  if (parsed === 0) return false;
+  return undefined;
 }

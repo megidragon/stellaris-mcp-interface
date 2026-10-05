@@ -3,12 +3,18 @@
 
 on_game_start_country = {
 	events = {
-		ai_player.0		# Initialize AI Player bridge
+		ai_player.1		# Initialize and export immediately
 	}
 }
 
-on_monthly_pulse_country = {
+on_single_player_save_game_load = {
 	events = {
-		ai_player.1		# Monthly state dump
+		ai_player.2		# Initialize an existing save and export immediately
+	}
+}
+
+on_monthly_pulse = {
+	events = {
+		ai_player.2		# Includes player Fallen Empires lacking country pulses
 	}
 }

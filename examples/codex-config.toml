@@ -1,0 +1,14 @@
+# Replace the absolute project path before adding this to ~/.codex/config.toml.
+# https://developers.openai.com/codex/mcp
+[mcp_servers.stellaris]
+command = "node"
+args = ["C:/path/to/stellaris-mcp-interface/dist/index.js"]
+startup_timeout_sec = 20
+tool_timeout_sec = 60
+
+[mcp_servers.stellaris.env]
+# Explicitly set this if Documents is redirected to a custom location.
+STELLARIS_DOCUMENTS_PATH = "C:/Users/your-user/Documents/Paradox Interactive/Stellaris"
+STELLARIS_ADVISOR_STYLE = "fallen_empire"
+# Optional: select a campaign folder; auto then uses that campaign's saves.
+# STELLARIS_SAVE_PROFILE = "your-campaign-folder"

@@ -18,6 +18,27 @@ ai_player_dump_diplomacy = {
 			}
 		}
 
-		log = "AI_DIPLO|\\[This.GetName]|\\[Root.ai_dip_opinion]|\\[This.is_rival]|\\[This.has_defensive_pact]|\\[This.is_at_war]"
+		# Triggers are not localization properties. Export their evaluated values
+		# as 0/1, scoped to the relation country and specifically against Root.
+		set_variable = { which = ai_dip_rival value = 0 }
+		set_variable = { which = ai_dip_pact value = 0 }
+		set_variable = { which = ai_dip_war value = 0 }
+		if = {
+			limit = { is_rival = root }
+			set_variable = { which = ai_dip_rival value = 1 }
+		}
+		if = {
+			limit = { has_defensive_pact = root }
+			set_variable = { which = ai_dip_pact value = 1 }
+		}
+		if = {
+			limit = { is_at_war_with = root }
+			set_variable = { which = ai_dip_war value = 1 }
+		}
+
+		log = "AI_DIPLO|\\[This.GetName]|\\[Root.ai_dip_opinion]|\\[This.ai_dip_rival]|\\[This.ai_dip_pact]|\\[This.ai_dip_war]"
+		clear_variable = ai_dip_rival
+		clear_variable = ai_dip_pact
+		clear_variable = ai_dip_war
 	}
 }

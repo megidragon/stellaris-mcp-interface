@@ -1,560 +1,411 @@
 import AdmZip from "adm-zip";
 import { Jomini } from "jomini";
-import { readFile, readdir, stat } from "fs/promises";
-import { join } from "path";
+import { readFile, readdir, stat } from "node:fs/promises";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import type {
-  GameState,
-  GameMeta,
-  PlayerState,
-  Country,
-  Planet,
-  Fleet,
-  TechState,
-  Leader,
-  Resources,
-  War,
-  Starbase,
-  Policy,
+  Country, Fleet, GameMeta, GameState, Leader, Planet, PlayerState,
+  Policy, Resources, TechState, War,
 } from "./types.js";
 import { RESOURCE_KEYS } from "./types.js";
 
-let jominiInstance: Jomini | null = null;
+type SaveObject = Record<string, unknown>;
+type Diagnostics = NonNullable<GameState["diagnostics"]>;
+
+export class SaveParseError extends Error {
+  constructor(public readonly code: string, message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "SaveParseError";
+  }
+}
+
+let jominiInstance: Promise<Jomini> | undefined;
 
 async function getJomini(): Promise<Jomini> {
-  if (!jominiInstance) {
-    jominiInstance = await Jomini.initialize();
-  }
+  jominiInstance ??= Jomini.initialize();
   return jominiInstance;
 }
 
-/**
- * Find the most recent save file in the given directory
- */
-export async function findLatestSave(
-  saveDir: string,
-  profile?: string
-): Promise<string | null> {
-  try {
-    const searchDir = profile ? join(saveDir, profile) : saveDir;
-    const entries = await readdir(searchDir);
-    const savFiles = entries.filter((f) => f.endsWith(".sav"));
+function errorCode(error: unknown): string | undefined {
+  return object(error)?.code as string | undefined;
+}
 
-    if (savFiles.length === 0) return null;
-
-    let latest = "";
-    let latestTime = 0;
-
-    for (const f of savFiles) {
-      const fpath = join(searchDir, f);
-      const s = await stat(fpath);
-      if (s.mtimeMs > latestTime) {
-        latestTime = s.mtimeMs;
-        latest = fpath;
+/** Search the save root and campaign subdirectories, without following symlinks. */
+export async function findLatestSave(saveDir: string, profile?: string): Promise<string | null> {
+  const root = resolve(saveDir);
+  const searchDir = profile ? resolve(root, profile) : root;
+  const profilePath = relative(root, searchDir);
+  if (isAbsolute(profilePath) || profilePath === ".." || profilePath.startsWith("..\\") || profilePath.startsWith("../")) {
+    throw new Error("Save profile must be inside the configured save directory");
+  }
+  const directories = [searchDir];
+  let latest: string | null = null;
+  let latestTime = -Infinity;
+  while (directories.length > 0) {
+    const directory = directories.pop();
+    if (!directory) continue;
+    let entries;
+    try {
+      entries = await readdir(directory, { withFileTypes: true });
+    } catch (error: unknown) {
+      if (errorCode(error) === "ENOENT") continue;
+      throw new Error(`Cannot inspect save directory: ${directory}`, { cause: error });
+    }
+    for (const entry of entries) {
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) {
+        directories.push(path);
+      } else if (entry.isFile() && entry.name.toLowerCase().endsWith(".sav")) {
+        try {
+          const info = await stat(path);
+          if (info.mtimeMs > latestTime || (info.mtimeMs === latestTime && (!latest || path < latest))) {
+            latest = path;
+            latestTime = info.mtimeMs;
+          }
+        } catch (error: unknown) {
+          // An autosave may be replaced between listing and statting it.
+          if (errorCode(error) !== "ENOENT") throw new Error(`Cannot inspect save file: ${path}`, { cause: error });
+        }
       }
     }
-
-    return latest;
-  } catch {
-    return null;
   }
+  return latest;
 }
 
-/**
- * Parse a Stellaris .sav file into structured game state
- */
+/** Read a compressed plaintext Stellaris save. Does not change the save or game. */
 export async function parseSaveFile(savePath: string): Promise<GameState> {
-  const jomini = await getJomini();
-  const buffer = await readFile(savePath);
-  const zip = new AdmZip(Buffer.from(buffer));
-
+  let zip: AdmZip;
+  try {
+    zip = new AdmZip(await readFile(savePath));
+  } catch (error: unknown) {
+    throw new SaveParseError("SAVE_READ_FAILED", `Cannot read Stellaris save archive: ${savePath}`, { cause: error });
+  }
   const gamestateEntry = zip.getEntry("gamestate");
   const metaEntry = zip.getEntry("meta");
-
-  if (!gamestateEntry) {
-    throw new Error("No gamestate found in save file");
+  if (!gamestateEntry) throw new SaveParseError("GAMESTATE_MISSING", `Save archive has no gamestate entry: ${savePath}`);
+  const parser = await getJomini();
+  let gs: SaveObject;
+  let meta: SaveObject;
+  try {
+    gs = object(parser.parseText(gamestateEntry.getData(), { typeNarrowing: "unquoted" })) ?? {};
+  } catch (error: unknown) {
+    throw new SaveParseError("GAMESTATE_PARSE_FAILED", `Cannot parse plaintext gamestate in ${savePath}`, { cause: error });
   }
-
-  const gamestateText = gamestateEntry.getData().toString("utf-8");
-  const metaText = metaEntry?.getData().toString("utf-8") || "";
-
-  const gamestate = jomini.parseText(gamestateText);
-  const meta = metaText ? jomini.parseText(metaText) : {};
-
-  return buildGameState(gamestate, meta);
-}
-
-function buildGameState(gs: any, meta: any): GameState {
+  try {
+    meta = metaEntry ? object(parser.parseText(metaEntry.getData(), { typeNarrowing: "unquoted" })) ?? {} : {};
+  } catch (error: unknown) {
+    throw new SaveParseError("META_PARSE_FAILED", `Cannot parse save metadata in ${savePath}`, { cause: error });
+  }
+  const diagnostics: Diagnostics = {
+    source: "save", savePath,
+    warnings: ["This is a partial save snapshot. Fields listed as missing are unknown; compatibility defaults are not measured values."],
+    missingFields: [],
+  };
+  if (!metaEntry) diagnostics.warnings.push("The archive has no meta entry; metadata is read from gamestate.");
   const gameMeta = extractMeta(meta, gs);
+  const version = /(?:^|\s)v?(\d+)\.(\d+)/i.exec(gameMeta.version);
+  if (version && Number(version[1]) < 4) {
+    diagnostics.warnings.push(`Legacy save version ${gameMeta.version}; it does not establish compatibility with the running Stellaris version.`);
+  } else {
+    diagnostics.warnings.push(`Save version ${gameMeta.version} is parsed with best-effort field extraction; current 4.x schemas have not been validated with a live campaign save.`);
+  }
+  if (meta.version !== undefined && gs.version !== undefined && str(meta.version) !== str(gs.version)) {
+    diagnostics.warnings.push("Metadata and gamestate report different versions; the metadata version is displayed.");
+  }
   const playerId = extractPlayerId(gs);
-  const countries = extractCountries(gs, playerId);
-  const player = extractPlayerState(gs, playerId);
-  const wars = extractWars(gs);
-
+  const playerData = object(findInObject(gs.country, playerId));
+  if (!playerData) throw new SaveParseError("PLAYER_COUNTRY_MISSING", `Player country ${playerId} does not exist in the save country table`);
   return {
     meta: gameMeta,
-    player,
-    countries,
-    wars,
-    timestamp: new Date().toISOString(),
+    player: extractPlayerState(gs, playerData, playerId, diagnostics),
+    countries: extractCountries(gs, playerId, diagnostics),
+    wars: extractWars(gs), timestamp: new Date().toISOString(), diagnostics,
   };
 }
 
-function extractMeta(meta: any, gs: any): GameMeta {
-  return {
-    version: safeStr(meta.version || gs.version, "unknown"),
-    name: extractName(meta.name || gs.name),
-    date: formatDate(meta.date || gs.date),
-    requiredDlcs: Array.isArray(meta.required_dlcs)
-      ? meta.required_dlcs
-      : [],
-  };
+function object(value: unknown): SaveObject | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value) && !(value instanceof Date)
+    ? value as SaveObject : undefined;
 }
 
-function extractPlayerId(gs: any): number {
-  // Player country is identified in the player array
-  if (gs.player && Array.isArray(gs.player)) {
-    for (const p of gs.player) {
-      if (p.country !== undefined) return Number(p.country);
-    }
-  }
-  // Fallback: look for player= at top level
-  if (gs.player?.country !== undefined) return Number(gs.player.country);
+function list(value: unknown): unknown[] {
+  return value === undefined || value === null ? [] : Array.isArray(value) ? value : [value];
+}
+
+function numeric(value: unknown): number | undefined {
+  if (typeof value !== "number" && typeof value !== "string") return undefined;
+  if (typeof value === "string" && value.trim() === "") return undefined;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : undefined;
+}
+
+function missing(diagnostics: Diagnostics, field: string): void {
+  if (!diagnostics.missingFields.includes(field)) diagnostics.missingFields.push(field);
+}
+
+function measured(value: unknown, field: string, diagnostics: Diagnostics): number {
+  const result = numeric(value);
+  if (result !== undefined) return result;
+  missing(diagnostics, field);
   return 0;
 }
 
-function safeNum(val: any, fallback = 0): number {
-  if (val === undefined || val === null) return fallback;
-  const n = Number(val);
-  return isNaN(n) ? fallback : n;
+function bool(value: unknown): boolean {
+  return value === true || value === "yes" || value === 1;
 }
 
-function safeStr(val: any, fallback = ""): string {
-  if (val === undefined || val === null) return fallback;
-  // Jomini parses names as { key: "...", literal: true } objects
-  if (typeof val === "object" && val !== null) {
-    if (val.key !== undefined) return String(val.key);
-    if (val.name !== undefined) return String(val.name);
-    // Date objects
-    if (val instanceof Date) return val.toISOString().split("T")[0];
-  }
-  return String(val);
+function str(value: unknown, fallback = ""): string {
+  if (typeof value === "string" || typeof value === "number") return String(value);
+  const data = object(value);
+  if (data?.key !== undefined) return str(data.key, fallback);
+  if (data?.name !== undefined) return str(data.name, fallback);
+  return fallback;
 }
 
-/** Extract a display name from jomini's name objects */
-function extractName(val: any): string {
-  if (!val) return "Unknown";
-  if (typeof val === "string") return val;
-  if (typeof val === "object") {
-    if (val.key) return String(val.key);
-    if (val.name) return String(val.name);
-    if (val.literal !== undefined && val.key !== undefined)
-      return String(val.key);
+/** Preserve localization/mod keys; no localization is guessed from an identifier. */
+function name(value: unknown): string {
+  const data = object(value);
+  if (data?.first_name !== undefined || data?.second_name !== undefined) {
+    return [str(data.first_name), str(data.second_name)].filter(Boolean).join(" ") || "Unknown";
   }
-  return String(val);
+  return str(value, "Unknown");
 }
 
-/** Format a date value from jomini (could be Date object or string) */
-function formatDate(val: any): string {
-  if (!val) return "unknown";
-  if (val instanceof Date) {
-    // Convert back to Stellaris date format YYYY.MM.DD
-    const y = val.getUTCFullYear();
-    const m = String(val.getUTCMonth() + 1).padStart(2, "0");
-    const d = String(val.getUTCDate()).padStart(2, "0");
-    return `${y}.${m}.${d}`;
+function formatDate(value: unknown): string {
+  if (value instanceof Date) {
+    return `${value.getUTCFullYear()}.${String(value.getUTCMonth() + 1).padStart(2, "0")}.${String(value.getUTCDate()).padStart(2, "0")}`;
   }
-  if (typeof val === "string") return val;
-  return String(val);
+  return str(value, "unknown");
 }
 
-function extractResources(countryData: any): {
-  stockpile: Resources;
-  income: Resources;
-} {
-  const stockpile = emptyResources();
-  const income = emptyResources();
+function extractMeta(meta: SaveObject, gs: SaveObject): GameMeta {
+  return {
+    version: str(meta.version ?? gs.version, "unknown"), name: name(meta.name ?? gs.name),
+    date: formatDate(meta.date ?? gs.date), requiredDlcs: strings(meta.required_dlcs ?? gs.required_dlcs),
+  };
+}
 
-  // Resources are stored in modules/standard_economy_module or similar
-  const modules = countryData.modules;
-  if (modules) {
-    const econ =
-      modules.standard_economy_module || modules.economy_module || {};
-    const resources = econ.resources;
-    if (resources) {
-      for (const key of RESOURCE_KEYS) {
-        if (resources[key] !== undefined) {
-          stockpile[key] = safeNum(resources[key]);
-        }
-      }
-    }
-    // Last month income
-    const lastMonth = econ.last_month;
-    if (lastMonth) {
-      for (const key of RESOURCE_KEYS) {
-        if (lastMonth[key] !== undefined) {
-          income[key] = safeNum(lastMonth[key]);
-        }
-      }
-    }
-  }
-
-  // Alternative: budget/current_month
-  if (countryData.budget) {
-    const current = countryData.budget.current_month;
-    if (current?.income) {
-      for (const key of RESOURCE_KEYS) {
-        if (current.income[key] !== undefined) {
-          income[key] = safeNum(current.income[key]);
-        }
-      }
-    }
-  }
-
-  return { stockpile, income };
+function extractPlayerId(gs: SaveObject): number {
+  const ids = new Set(list(gs.player).map(p => numeric(object(p)?.country)).filter((id): id is number => id !== undefined && Number.isInteger(id) && id >= 0 && id !== 4294967295));
+  if (ids.size === 0) throw new SaveParseError("PLAYER_MISSING", "Save has no resolvable player country; refusing to assume country 0");
+  if (ids.size > 1) throw new SaveParseError("PLAYER_AMBIGUOUS", "Save contains multiple player countries; select a single-player or cooperative empire save");
+  return [...ids][0];
 }
 
 function emptyResources(): Resources {
-  return {
-    energy: 0,
-    minerals: 0,
-    food: 0,
-    consumer_goods: 0,
-    alloys: 0,
-    volatile_motes: 0,
-    exotic_gases: 0,
-    rare_crystals: 0,
-    dark_matter: 0,
-    living_metal: 0,
-    zro: 0,
-    nanites: 0,
-    minor_artifacts: 0,
-    influence: 0,
-    unity: 0,
-    physics_research: 0,
-    society_research: 0,
-    engineering_research: 0,
-  };
+  return Object.fromEntries(RESOURCE_KEYS.map(key => [key, 0])) as unknown as Resources;
 }
 
-function extractPlayerState(gs: any, playerId: number): PlayerState {
-  const countryMap = gs.country || {};
-  const countryData = findInObject(countryMap, playerId);
+const RESOURCE_ALIASES: Record<string, string> = {
+  sr_dark_matter: "dark_matter", sr_living_metal: "living_metal", sr_zro: "zro",
+};
 
-  if (!countryData) {
-    return {
-      countryId: playerId,
-      name: "Unknown",
-      resources: emptyResources(),
-      resourceIncome: emptyResources(),
-      planets: [],
-      fleets: [],
-      technologies: {
-        physics: { current: "", progress: 0, output: 0 },
-        society: { current: "", progress: 0, output: 0 },
-        engineering: { current: "", progress: 0, output: 0 },
-        completed: [],
-      },
-      leaders: [],
-      starbases: [],
-      traditions: [],
-      ascensionPerks: [],
-      edicts: [],
-      policies: [],
-      navySize: 0,
-      navyCap: 0,
-      empireCohesion: 0,
-    };
+/** Budgets are either direct resource maps or nested maps of economic categories. */
+function resourceMap(value: unknown): Record<string, number> {
+  const result: Record<string, number> = {};
+  for (const [key, amount] of Object.entries(object(value) ?? {})) {
+    const number = numeric(amount);
+    if (number !== undefined) result[key] = (result[key] ?? 0) + number;
+    else if (object(amount)) {
+      for (const [resource, quantity] of Object.entries(resourceMap(amount))) result[resource] = (result[resource] ?? 0) + quantity;
+    }
   }
+  return result;
+}
 
-  const { stockpile, income } = extractResources(countryData);
-  const planets = extractPlanets(gs, countryData);
-  const fleets = extractFleets(gs, countryData);
-  const tech = extractTech(countryData);
-  const leaders = extractLeaders(countryData);
+function resources(value: Record<string, number>, field: string, diagnostics: Diagnostics): Resources {
+  const result = Object.assign(emptyResources(), value);
+  for (const [raw, canonical] of Object.entries(RESOURCE_ALIASES)) {
+    if (value[raw] !== undefined && value[canonical] === undefined) result[canonical] = value[raw];
+  }
+  for (const key of RESOURCE_KEYS) {
+    const alias = Object.entries(RESOURCE_ALIASES).find(([, canonical]) => canonical === key)?.[0];
+    if (value[key] === undefined && (!alias || value[alias] === undefined)) missing(diagnostics, `${field}.${key}`);
+  }
+  return result;
+}
 
+function extractResources(country: SaveObject, diagnostics: Diagnostics): { stockpile: Resources; income: Resources } {
+  const modules = object(country.modules);
+  const economy = object(modules?.standard_economy_module ?? modules?.economy_module);
+  const current = object(object(country.budget)?.current_month);
+  let net = resourceMap(current?.balance);
+  if (current?.balance === undefined && current?.income !== undefined && current?.expenses !== undefined) {
+    net = resourceMap(current.income);
+    for (const [key, expense] of Object.entries(resourceMap(current.expenses))) net[key] = (net[key] ?? 0) - expense;
+  } else if (!current && economy?.last_month !== undefined) {
+    net = resourceMap(economy.last_month);
+    diagnostics.warnings.push("Resource income uses the economy module's last_month values rather than the current budget.");
+  }
   return {
-    countryId: playerId,
-    name: extractName(countryData.name),
-    resources: stockpile,
-    resourceIncome: income,
-    planets,
-    fleets,
-    technologies: tech,
-    leaders,
-    starbases: [],
-    traditions: extractArray(countryData.traditions),
-    ascensionPerks: extractArray(countryData.ascension_perks),
-    edicts: extractArray(countryData.active_edicts),
-    policies: extractPolicies(countryData),
-    navySize: safeNum(countryData.fleet_size),
-    navyCap: safeNum(countryData.navy_cap),
-    empireCohesion: safeNum(countryData.empire_cohesion),
+    stockpile: resources(resourceMap(economy?.resources), "player.resources", diagnostics),
+    income: resources(net, "player.resourceIncome", diagnostics),
   };
 }
 
-function extractPlanets(gs: any, countryData: any): Planet[] {
-  const planets: Planet[] = [];
-  const ownedPlanetIds = extractNumArray(countryData.owned_planets);
-  const planetMap = gs.planets?.planet || gs.planet || {};
+function extractPlayerState(gs: SaveObject, country: SaveObject, playerId: number, diagnostics: Diagnostics): PlayerState {
+  const { stockpile, income } = extractResources(country, diagnostics);
+  missing(diagnostics, "player.starbases");
+  return {
+    countryId: playerId, name: name(country.name), resources: stockpile, resourceIncome: income,
+    planets: extractPlanets(gs, country, diagnostics), fleets: extractFleets(gs, country, diagnostics),
+    technologies: extractTech(country, income, diagnostics), leaders: extractLeaders(gs, country, diagnostics), starbases: [],
+    traditions: strings(country.traditions), ascensionPerks: strings(country.ascension_perks),
+    edicts: strings(country.active_edicts), policies: extractPolicies(country),
+    navySize: measured(country.used_naval_capacity ?? country.fleet_size, "player.navySize", diagnostics),
+    navyCap: measured(country.navy_cap, "player.navyCap", diagnostics),
+    empireCohesion: measured(country.empire_cohesion, "player.empireCohesion", diagnostics),
+  };
+}
 
-  for (const pid of ownedPlanetIds) {
-    const pdata = findInObject(planetMap, pid);
-    if (!pdata) continue;
-
+function extractPlanets(gs: SaveObject, country: SaveObject, diagnostics: Diagnostics): Planet[] {
+  const planetMap = object(gs.planets)?.planet ?? gs.planet;
+  if (country.owned_planets === undefined) missing(diagnostics, "player.planets");
+  return ids(country.owned_planets).flatMap(id => {
+    const data = object(findInObject(planetMap, id));
+    const field = `player.planets[${id}]`;
+    if (!data) { missing(diagnostics, field); return []; }
+    if (data.buildings === undefined) missing(diagnostics, `${field}.buildings`);
+    if (data.district === undefined) missing(diagnostics, `${field}.districts`);
+    if (data.designation === undefined && data.planet_designation === undefined && data.colony_type === undefined) {
+      missing(diagnostics, `${field}.designation`);
+    }
     const buildings: string[] = [];
-    if (pdata.buildings) {
-      const bldgs = Array.isArray(pdata.buildings) ? pdata.buildings : Object.values(pdata.buildings);
-      for (const b of bldgs) {
-        if (b?.type) buildings.push(safeStr(b.type));
-        else if (typeof b === "string") buildings.push(b);
-      }
+    for (const entry of list(data.buildings)) {
+      const reference = numeric(entry);
+      const type = reference !== undefined ? str(object(findInObject(gs.buildings, reference))?.type) : str(object(entry)?.type ?? entry);
+      if (type) buildings.push(type);
+      else missing(diagnostics, `${field}.buildings[${str(entry)}]`);
     }
-
     const districts: Record<string, number> = {};
-    if (pdata.district) {
-      const dists = Array.isArray(pdata.district) ? pdata.district : [pdata.district];
-      for (const d of dists) {
-        const dtype = safeStr(d?.type || d);
-        if (dtype) districts[dtype] = (districts[dtype] || 0) + 1;
+    for (const entry of list(data.district)) {
+      const type = str(object(entry)?.type ?? entry);
+      if (type) districts[type] = (districts[type] ?? 0) + 1;
+    }
+    let freeJobs = data.free_jobs;
+    if (freeJobs === undefined && Array.isArray(data.jobs_cache)) {
+      const jobs = data.jobs_cache.map(object).filter((job): job is SaveObject => job !== undefined);
+      if (jobs.length > 0 && jobs.every(job => numeric(job.max_employed) !== undefined && numeric(job.num_employed) !== undefined)) {
+        freeJobs = jobs.reduce((total, job) => total + (numeric(job.max_employed) ?? 0) - (numeric(job.num_employed) ?? 0), 0);
       }
     }
-
-    planets.push({
-      id: pid,
-      name: extractName(pdata.name),
-      planetClass: safeStr(pdata.planet_class),
-      size: safeNum(pdata.planet_size),
-      pops: safeNum(
-        Array.isArray(pdata.pop) ? pdata.pop.length : pdata.num_pops
-      ),
-      buildings,
-      districts,
-      stability: safeNum(pdata.stability),
-      amenities: safeNum(pdata.amenities),
-      housing: safeNum(pdata.housing),
-      freeHousing: safeNum(pdata.free_housing),
-      crime: safeNum(pdata.crime),
-      freeJobs: safeNum(pdata.free_jobs),
-      designation: safeStr(pdata.designation || pdata.planet_designation),
-      modifiers: extractArray(pdata.timed_modifier?.modifier || pdata.modifier),
-    });
-  }
-
-  return planets;
+    return [{
+      id, name: name(data.name), planetClass: str(data.planet_class),
+      size: measured(data.planet_size, `${field}.size`, diagnostics),
+      pops: measured(Array.isArray(data.pop) ? data.pop.length : data.num_pops ?? data.num_sapient_pops, `${field}.pops`, diagnostics),
+      buildings, districts, stability: measured(data.stability, `${field}.stability`, diagnostics),
+      amenities: measured(data.free_amenities ?? data.amenities, `${field}.amenities`, diagnostics),
+      housing: measured(data.total_housing ?? data.housing, `${field}.housing`, diagnostics),
+      freeHousing: measured(data.free_housing, `${field}.freeHousing`, diagnostics),
+      crime: measured(data.crime, `${field}.crime`, diagnostics), freeJobs: measured(freeJobs, `${field}.freeJobs`, diagnostics),
+      designation: str(data.designation ?? data.planet_designation ?? data.colony_type),
+      modifiers: list(data.timed_modifier).flatMap(modifier => strings(object(modifier)?.modifier)).concat(strings(data.modifier)),
+    }];
+  });
 }
 
-function extractFleets(gs: any, countryData: any): Fleet[] {
-  const fleets: Fleet[] = [];
-  const fleetIds = extractNumArray(countryData.fleets_manager?.owned_fleets);
-  const fleetMap = gs.fleet || {};
-
-  for (const fid of fleetIds) {
-    const fdata = findInObject(fleetMap, fid);
-    if (!fdata) continue;
-
-    const shipCount = Array.isArray(fdata.ships)
-      ? fdata.ships.length
-      : safeNum(fdata.num_ships);
-
-    fleets.push({
-      id: fid,
-      name: extractName(fdata.name),
-      ships: shipCount,
-      militaryPower: safeNum(fdata.military_power),
-      isMilitary: fdata.military !== undefined ? Boolean(fdata.military) : true,
-      isCivilian: fdata.civilian !== undefined ? Boolean(fdata.civilian) : false,
-      location: safeStr(fdata.movement_manager?.coordinate?.origin),
-      mia: Boolean(fdata.mia),
-    });
-  }
-
-  return fleets;
+function extractFleets(gs: SaveObject, country: SaveObject, diagnostics: Diagnostics): Fleet[] {
+  const references = object(country.fleets_manager)?.owned_fleets ?? country.owned_fleets;
+  if (references === undefined) missing(diagnostics, "player.fleets");
+  return ids(references, "fleet").flatMap(id => {
+    const data = object(findInObject(gs.fleet, id));
+    const field = `player.fleets[${id}]`;
+    if (!data) { missing(diagnostics, field); return []; }
+    const civilian = bool(data.civilian);
+    return [{
+      id, name: name(data.name), ships: measured(Array.isArray(data.ships) ? data.ships.length : data.num_ships, `${field}.ships`, diagnostics),
+      militaryPower: measured(data.military_power, `${field}.militaryPower`, diagnostics),
+      isMilitary: data.military !== undefined ? bool(data.military) : !civilian && !bool(data.station), isCivilian: civilian,
+      location: str(object(object(data.movement_manager)?.coordinate)?.origin), mia: bool(data.mia),
+    }];
+  });
 }
 
-function extractTech(countryData: any): TechState {
-  const completed: string[] = [];
-  if (countryData.tech_status) {
-    const techStatus = countryData.tech_status;
-    if (techStatus.technology) {
-      const techs = Array.isArray(techStatus.technology)
-        ? techStatus.technology
-        : [techStatus.technology];
-      for (const t of techs) {
-        if (typeof t === "string") completed.push(t);
-        else if (t?.technology) completed.push(safeStr(t.technology));
-      }
+function extractTech(country: SaveObject, income: Resources, diagnostics: Diagnostics): TechState {
+  const status = object(country.tech_status);
+  const active = object(status?.active_research);
+  function area(areaName: "physics" | "society" | "engineering") {
+    const data = object(active?.[areaName]) ?? object(list(status?.[`${areaName}_queue`])[0]);
+    if (!data) missing(diagnostics, `player.technologies.${areaName}.current`);
+    if (diagnostics.missingFields.includes(`player.resourceIncome.${areaName}_research`)) {
+      missing(diagnostics, `player.technologies.${areaName}.output`);
     }
-  }
-
-  const activeResearch = countryData.tech_status?.active_research || {};
-  const areas = ["physics", "society", "engineering"] as const;
-  const research: Record<string, { current: string; progress: number; output: number }> = {};
-
-  for (const area of areas) {
-    const areaData = activeResearch[area] || {};
-    research[area] = {
-      current: safeStr(areaData.technology),
-      progress: safeNum(areaData.progress),
-      output: 0,
+    return {
+      current: str(data?.technology), progress: measured(data?.progress, `player.technologies.${areaName}.progress`, diagnostics),
+      output: income[`${areaName}_research`],
     };
   }
-
-  return {
-    physics: research.physics,
-    society: research.society,
-    engineering: research.engineering,
-    completed,
-  };
+  return { physics: area("physics"), society: area("society"), engineering: area("engineering"), completed: strings(status?.technology, "technology") };
 }
 
-function extractLeaders(countryData: any): Leader[] {
-  const leaders: Leader[] = [];
-  const leaderData = countryData.owned_leaders || countryData.leaders;
-  if (!leaderData) return leaders;
-
-  const leaderList = Array.isArray(leaderData) ? leaderData : [leaderData];
-  for (const l of leaderList) {
-    if (!l) continue;
-    leaders.push({
-      id: safeNum(l.id),
-      name: extractName(l.name),
-      class: safeStr(l.class),
-      level: safeNum(l.level),
-      age: safeNum(l.age),
-      traits: extractArray(l.traits),
-    });
-  }
-
-  return leaders;
+function extractLeaders(gs: SaveObject, country: SaveObject, diagnostics: Diagnostics): Leader[] {
+  const references = country.owned_leaders ?? country.leaders;
+  if (references === undefined) missing(diagnostics, "player.leaders");
+  return list(references).flatMap(reference => {
+    const id = numeric(object(reference)?.id ?? reference);
+    const data = object(reference) ?? (id === undefined ? undefined : object(findInObject(gs.leaders ?? gs.leader, id)));
+    if (!data || id === undefined) { missing(diagnostics, `player.leaders[${str(reference)}]`); return []; }
+    const field = `player.leaders[${id}]`;
+    const role = object(object(data.roles)?.[str(data.class)]);
+    return [{
+      id, name: name(data.name), class: str(data.class), level: measured(data.level, `${field}.level`, diagnostics),
+      age: measured(data.age, `${field}.age`, diagnostics), traits: strings(data.traits ?? role?.trait),
+    }];
+  });
 }
 
-function extractCountries(gs: any, playerId: number): Country[] {
-  const countries: Country[] = [];
-  const countryMap = gs.country || {};
-  const playerRelations = gs.country
-    ? findInObject(countryMap, playerId)?.relations_manager
-    : null;
-
-  const entries = Object.entries(countryMap);
-  for (const [idStr, data] of entries) {
-    const id = Number(idStr);
-    if (isNaN(id) || id === playerId) continue;
-    const c = data as any;
-    if (!c || c.type === "fallen_empire_remnants") continue;
-
-    const countryType = safeStr(c.type || c.country_type);
-    if (
-      countryType !== "default" &&
-      countryType !== "fallen_empire" &&
-      countryType !== "awakened_fallen_empire"
-    ) {
-      continue;
-    }
-
-    let opinion = 0;
-    let isRival = false;
-    let hasDefensivePact = false;
-    let attitude = "unknown";
-
-    if (playerRelations?.relation) {
-      const relations = Array.isArray(playerRelations.relation)
-        ? playerRelations.relation
-        : [playerRelations.relation];
-      for (const rel of relations) {
-        if (safeNum(rel?.country) === id) {
-          opinion = safeNum(rel.opinion);
-          isRival = Boolean(rel.is_rival);
-          hasDefensivePact = Boolean(rel.defensive_pact);
-          attitude = safeStr(rel.attitude);
-          break;
-        }
-      }
-    }
-
-    countries.push({
-      id,
-      name: extractName(c.name),
-      type: countryType,
-      government: safeStr(c.government?.type),
-      ethics: extractArray(c.ethos?.ethic),
-      militaryPower: safeNum(c.military_power),
-      techPower: safeNum(c.tech_power),
-      economyPower: safeNum(c.economy_power),
-      numPlanets: safeNum(
-        Array.isArray(c.owned_planets) ? c.owned_planets.length : c.num_owned_planets
-      ),
-      numPops: safeNum(c.num_pops),
-      opinion,
-      isRival,
-      hasDefensivePact,
-      hasFederation: Boolean(c.federation),
-      isAtWar: Boolean(c.at_war),
-      attitude,
-    });
-  }
-
-  return countries;
+function extractCountries(gs: SaveObject, playerId: number, diagnostics: Diagnostics): Country[] {
+  const player = object(findInObject(gs.country, playerId));
+  const relations = list(object(player?.relations_manager)?.relation).map(object);
+  return Object.entries(object(gs.country) ?? {}).flatMap(([idText, value]) => {
+    const id = numeric(idText);
+    const data = object(value);
+    if (id === undefined || id === playerId || !data) return [];
+    const type = str(data.type ?? data.country_type);
+    if (!type) return [];
+    const relation = relations.find(item => numeric(item?.country) === id);
+    const field = `countries[${id}]`;
+    return [{
+      id, name: name(data.name), type, government: str(object(data.government)?.type), ethics: strings(object(data.ethos)?.ethic),
+      militaryPower: measured(data.military_power, `${field}.militaryPower`, diagnostics),
+      techPower: measured(data.tech_power, `${field}.techPower`, diagnostics), economyPower: measured(data.economy_power, `${field}.economyPower`, diagnostics),
+      numPlanets: measured(Array.isArray(data.owned_planets) ? data.owned_planets.length : data.num_owned_planets, `${field}.numPlanets`, diagnostics),
+      numPops: measured(data.num_pops ?? data.sapient, `${field}.numPops`, diagnostics), opinion: measured(relation?.opinion, `${field}.opinion`, diagnostics),
+      isRival: bool(relation?.is_rival), hasDefensivePact: bool(relation?.defensive_pact),
+      hasFederation: data.federation !== undefined && numeric(data.federation) !== 4294967295,
+      isAtWar: bool(data.at_war), attitude: str(relation?.attitude, "unknown"),
+    }];
+  });
 }
 
-function extractWars(gs: any): War[] {
-  const wars: War[] = [];
-  const warMap = gs.war || {};
-  const warEntries = Array.isArray(warMap) ? warMap : Object.values(warMap);
-
-  for (const w of warEntries) {
-    if (!w || typeof w !== "object") continue;
-    wars.push({
-      name: extractName(w.name),
-      attackers: extractArray(w.attackers?.map?.((a: any) => safeStr(a?.country)) || []),
-      defenders: extractArray(w.defenders?.map?.((d: any) => safeStr(d?.country)) || []),
-      warGoal: safeStr(w.war_goal?.type),
-      startDate: formatDate(w.start_date),
-    });
-  }
-
-  return wars;
+function extractWars(gs: SaveObject): War[] {
+  const entries = Array.isArray(gs.war) ? gs.war : Object.values(object(gs.war) ?? {});
+  return entries.flatMap(value => {
+    const data = object(value);
+    if (!data) return [];
+    return [{
+      name: name(data.name), attackers: ids(data.attackers, "country").map(String), defenders: ids(data.defenders, "country").map(String),
+      warGoal: str(object(data.war_goal)?.type), startDate: formatDate(data.start_date),
+    }];
+  });
 }
 
-function extractPolicies(countryData: any): Policy[] {
-  const policies: Policy[] = [];
-  if (countryData.policies) {
-    const pols = Array.isArray(countryData.policies)
-      ? countryData.policies
-      : Object.values(countryData.policies);
-    for (const p of pols) {
-      if (p?.policy) {
-        policies.push({
-          name: safeStr(p.policy),
-          selected: safeStr(p.selected),
-        });
-      }
-    }
-  }
-  return policies;
+function extractPolicies(country: SaveObject): Policy[] {
+  const raw = country.active_policies ?? country.policies;
+  const values = object(raw)?.policy !== undefined ? [raw] : Array.isArray(raw) ? raw : Object.values(object(raw) ?? {});
+  return values.flatMap(value => {
+    const data = object(value);
+    return data?.policy !== undefined ? [{ name: str(data.policy), selected: str(data.selected) }] : [];
+  });
 }
 
-// --- Utility functions ---
-
-function findInObject(obj: any, id: number): any {
-  if (!obj) return null;
-  // Jomini may produce objects with numeric-string keys or arrays
-  if (obj[id] !== undefined) return obj[id];
-  if (obj[String(id)] !== undefined) return obj[String(id)];
-  // May be an array indexed by id
-  if (Array.isArray(obj) && obj[id]) return obj[id];
-  return null;
+function findInObject(value: unknown, id: number): unknown {
+  return Array.isArray(value) ? value[id] : object(value)?.[String(id)];
 }
 
-function extractArray(val: any): string[] {
-  if (!val) return [];
-  if (Array.isArray(val)) return val.map(String);
-  if (typeof val === "string") return [val];
-  return [];
+function strings(value: unknown, key?: string): string[] {
+  return list(value).map(item => str(key ? object(item)?.[key] ?? item : item)).filter(Boolean);
 }
 
-function extractNumArray(val: any): number[] {
-  if (!val) return [];
-  if (Array.isArray(val)) return val.map(Number).filter((n) => !isNaN(n));
-  if (typeof val === "number") return [val];
-  return [];
+function ids(value: unknown, key?: string): number[] {
+  return list(value).map(item => numeric(key ? object(item)?.[key] ?? item : item)).filter((id): id is number => id !== undefined && Number.isInteger(id) && id >= 0 && id !== 4294967295);
 }

@@ -4,17 +4,11 @@
  */
 import { parseSaveFile, findLatestSave } from "./save-parser.js";
 import { formatGameState } from "../tools/get-game-state.js";
-import { homedir } from "os";
 import { join } from "path";
+import { loadConfig } from "../config.js";
 
 async function main() {
-  const saveDir = join(
-    homedir(),
-    "Documents",
-    "Paradox Interactive",
-    "Stellaris",
-    "save games"
-  );
+  const saveDir = loadConfig().saveGamesPath;
 
   console.log("Looking for save files in:", saveDir);
 

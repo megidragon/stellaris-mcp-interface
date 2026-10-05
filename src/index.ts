@@ -3,8 +3,6 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { loadConfig } from "./config.js";
-import { parseSaveFile, findLatestSave } from "./parser/save-parser.js";
-import { parseGameLog } from "./parser/log-parser.js";
 import { LogWatcher } from "./watcher/log-watcher.js";
 import { SaveWatcher } from "./watcher/save-watcher.js";
 import { CommandWriter } from "./commands/command-writer.js";
@@ -13,7 +11,6 @@ import {
   getGameStateFromSave,
   formatGameState,
 } from "./tools/get-game-state.js";
-import type { GameState, Resources } from "./parser/types.js";
 import { RESOURCE_KEYS } from "./parser/types.js";
 
 const config = loadConfig();
@@ -29,7 +26,7 @@ const server = new McpServer({
 // ─── Tool: get_game_state ───────────────────────────────────────
 server.tool(
   "get_game_state",
-  "Get the complete current game state from Stellaris (resources, planets, fleets, tech, diplomacy). Parses the latest save file or reads real-time log data from the mod.",
+  "Read a Stellaris snapshot from the latest save or a partial monthly mod report. Returns the source and game date; unavailable fields are not current measurements.",
   {
     source: z
       .enum(["auto", "save", "log"])
@@ -49,6 +46,7 @@ server.tool(
     if (source === "save") {
       result = await getGameStateFromSave(effectiveConfig);
     } else if (source === "log") {
+      await logWatcher.refresh();
       const logState = logWatcher.latestState;
       result = { source: "game_log", state: logState };
     } else {
@@ -59,7 +57,8 @@ server.tool(
       content: [
         {
           type: "text" as const,
-          text: formatGameState(result.state, result.source),
+          text: formatGameState(result.state, result.source) +
+            ("error" in result && result.error ? `\nError: ${result.error}` : ""),
         },
       ],
     };
@@ -78,25 +77,25 @@ server.tool(
       ? { ...config, saveProfile: save_profile }
       : config;
 
-    const { state } = await getGameState(effectiveConfig, logWatcher);
+    const { state, source, error } = await getGameState(effectiveConfig, logWatcher);
     if (!state) {
-      return { content: [{ type: "text" as const, text: "No game state available." }] };
+      return { content: [{ type: "text" as const, text: error || "No game state available." }] };
     }
 
     let text: string;
     if ("player" in state) {
       const { resources, resourceIncome } = state.player;
-      const lines = ["# Resources\n| Resource | Stockpile | Monthly |", "|----------|-----------|---------|"];
-      for (const k of RESOURCE_KEYS) {
-        const s = resources[k];
-        const i = resourceIncome[k];
+      const lines = [`# Resources (source: ${source}, date: ${state.meta.date})\n| Resource | Stockpile | Monthly |`, "|----------|-----------|---------|"];
+      for (const k of new Set([...RESOURCE_KEYS, ...Object.keys(resources), ...Object.keys(resourceIncome)])) {
+        const s = resources[k] ?? 0;
+        const i = resourceIncome[k] ?? 0;
         if (s > 0 || i !== 0) {
           lines.push(`| ${k} | ${s.toFixed(0)} | ${i >= 0 ? "+" : ""}${i.toFixed(1)} |`);
         }
       }
-      text = lines.join("\n");
+      text = lines.join("\n") + diagnosticNotice(state.diagnostics);
     } else {
-      text = "Resource data from log:\n" + JSON.stringify(state.resources, null, 2);
+      text = `Resource report (source: ${source}, date: ${state.date}):\n` + JSON.stringify({ stockpiles: state.resources, monthlyIncome: state.resourceIncome }, null, 2);
     }
 
     return { content: [{ type: "text" as const, text }] };
@@ -115,15 +114,15 @@ server.tool(
       ? { ...config, saveProfile: save_profile }
       : config;
 
-    const { state } = await getGameState(effectiveConfig, logWatcher);
+    const { state, source, error } = await getGameState(effectiveConfig, logWatcher);
     if (!state) {
-      return { content: [{ type: "text" as const, text: "No game state available." }] };
+      return { content: [{ type: "text" as const, text: error || "No game state available." }] };
     }
 
     let text: string;
     if ("player" in state) {
       const planets = state.player.planets;
-      const lines = [`# Owned Planets (${planets.length})\n`];
+      const lines = [`# Owned Planets (${planets.length}, source: ${source}, date: ${state.meta.date})\n`];
       for (const p of planets) {
         lines.push(`## ${p.name} (ID: ${p.id})`);
         lines.push(`- Class: ${p.planetClass}, Size: ${p.size}`);
@@ -141,9 +140,10 @@ server.tool(
         }
         lines.push("");
       }
-      text = lines.join("\n");
+      text = lines.join("\n") + diagnosticNotice(state.diagnostics);
     } else {
-      text = JSON.stringify(state.planets, null, 2);
+      text = state.planets ? JSON.stringify({ source, date: state.date, planets: state.planets }, null, 2) :
+        "No planet details in this monthly report. Save data provides stable planet IDs and additional details.";
     }
 
     return { content: [{ type: "text" as const, text }] };
@@ -162,9 +162,9 @@ server.tool(
       ? { ...config, saveProfile: save_profile }
       : config;
 
-    const { state } = await getGameState(effectiveConfig, logWatcher);
+    const { state, source, error } = await getGameState(effectiveConfig, logWatcher);
     if (!state) {
-      return { content: [{ type: "text" as const, text: "No game state available." }] };
+      return { content: [{ type: "text" as const, text: error || "No game state available." }] };
     }
 
     let text: string;
@@ -173,7 +173,7 @@ server.tool(
       const military = fleets.filter((f) => f.militaryPower > 0);
       const civilian = fleets.filter((f) => f.militaryPower === 0);
 
-      const lines = [`# Fleets - Navy: ${navySize}/${navyCap}\n`];
+      const lines = [`# Fleets - Navy: ${navySize}/${navyCap} (source: ${source}, date: ${state.meta.date})\n`];
       lines.push(`## Military Fleets (${military.length})`);
       for (const f of military) {
         lines.push(`- **${f.name}** (ID: ${f.id}): ${f.ships} ships, ${f.militaryPower.toFixed(0)} power, location: ${f.location || "unknown"}${f.mia ? " [MIA]" : ""}`);
@@ -182,9 +182,10 @@ server.tool(
       for (const f of civilian) {
         lines.push(`- **${f.name}** (ID: ${f.id}): ${f.ships} ships`);
       }
-      text = lines.join("\n");
+      text = lines.join("\n") + diagnosticNotice(state.diagnostics);
     } else {
-      text = JSON.stringify(state.fleets, null, 2);
+      text = state.fleets ? JSON.stringify({ source, date: state.date, fleets: state.fleets }, null, 2) :
+        "No fleet details in this monthly report. Save data provides stable fleet IDs and additional details.";
     }
 
     return { content: [{ type: "text" as const, text }] };
@@ -194,7 +195,7 @@ server.tool(
 // ─── Tool: get_technologies ─────────────────────────────────────
 server.tool(
   "get_technologies",
-  "Get current research status and completed technologies.",
+  "Read selected research and completed technologies from the latest save. The monthly log reports output only, so this tool uses save data.",
   {
     save_profile: z.string().optional(),
   },
@@ -203,14 +204,14 @@ server.tool(
       ? { ...config, saveProfile: save_profile }
       : config;
 
-    const { state } = await getGameState(effectiveConfig, logWatcher);
+    const { state, source, error } = await getGameStateFromSave(effectiveConfig);
     if (!state || !("player" in state)) {
-      return { content: [{ type: "text" as const, text: "No tech data available." }] };
+      return { content: [{ type: "text" as const, text: error || "No tech data available." }] };
     }
 
     const { technologies } = state.player;
     const lines = [
-      "# Research Status\n",
+      `# Research Status (source: ${source}, date: ${state.meta.date})\n`,
       `## Currently Researching`,
       `- **Physics:** ${technologies.physics.current || "none"} (progress: ${technologies.physics.progress.toFixed(0)})`,
       `- **Society:** ${technologies.society.current || "none"} (progress: ${technologies.society.progress.toFixed(0)})`,
@@ -220,14 +221,14 @@ server.tool(
       technologies.completed.join(", "),
     ];
 
-    return { content: [{ type: "text" as const, text: lines.join("\n") }] };
+    return { content: [{ type: "text" as const, text: lines.join("\n") + diagnosticNotice(state.diagnostics) }] };
   }
 );
 
 // ─── Tool: get_diplomacy ────────────────────────────────────────
 server.tool(
   "get_diplomacy",
-  "Get diplomatic relations with all known empires (opinion, rivalries, pacts, wars).",
+  "Read available diplomatic records. Monthly reports cover contacted default empires; saves can include unexplored country records. Missing relation fields appear in diagnostics.",
   {
     save_profile: z.string().optional(),
   },
@@ -236,14 +237,14 @@ server.tool(
       ? { ...config, saveProfile: save_profile }
       : config;
 
-    const { state } = await getGameState(effectiveConfig, logWatcher);
+    const { state, source, error } = await getGameState(effectiveConfig, logWatcher);
     if (!state) {
-      return { content: [{ type: "text" as const, text: "No diplomacy data available." }] };
+      return { content: [{ type: "text" as const, text: error || "No diplomacy data available." }] };
     }
 
     let text: string;
-    if ("countries" in state && state.countries) {
-      const lines = [`# Diplomatic Relations\n`];
+    if ("player" in state) {
+      const lines = [`# Diplomatic Relations (source: ${source}, date: ${state.meta.date})\n`];
       for (const c of state.countries) {
         const tags: string[] = [];
         if (c.isRival) tags.push("RIVAL");
@@ -267,9 +268,9 @@ server.tool(
         }
       }
 
-      text = lines.join("\n");
+      text = lines.join("\n") + diagnosticNotice(state.diagnostics);
     } else {
-      text = JSON.stringify(state, null, 2);
+      text = JSON.stringify({ source, date: state.date, diplomacy: state.diplomacy ?? "unavailable" }, null, 2);
     }
 
     return { content: [{ type: "text" as const, text }] };
@@ -279,7 +280,7 @@ server.tool(
 // ─── Tool: execute_command ──────────────────────────────────────
 server.tool(
   "execute_command",
-  "Queue a console command for Stellaris. Commands are written to ai_commands.txt, which must be executed in-game via `run ai_commands.txt` in the console (~).",
+  "Write a console command to a unique batch file. This does not execute it: the player must run the exact returned `run <filename>` command in the Stellaris console.",
   {
     command: z.string().describe("Console command to execute (e.g. 'cash 1000', 'research_technology tech_lasers_2')"),
   },
@@ -293,7 +294,7 @@ server.tool(
 // ─── Tool: execute_effect ───────────────────────────────────────
 server.tool(
   "execute_effect",
-  "Queue a PDXScript effect command. Wraps the effect in `effect { ... }` syntax. Written to ai_commands.txt for execution via console.",
+  "Write PDXScript prefixed with `effect` to a unique batch file for manual execution. The returned filename must be run in the game console; writing is not execution.",
   {
     effect: z.string().describe("PDXScript effect code (e.g. 'add_resource = { energy = 500 }')"),
   },
@@ -307,7 +308,7 @@ server.tool(
 // ─── Tool: queue_commands ───────────────────────────────────────
 server.tool(
   "queue_commands",
-  "Queue multiple console commands at once. They will all be written to ai_commands.txt.",
+  "Write multiple console commands to a unique batch file and return the exact console command needed to execute it manually.",
   {
     commands: z
       .array(z.string())
@@ -365,19 +366,21 @@ server.tool(
   "Get a comprehensive strategic analysis of the current game situation, combining all available data sources.",
   {
     save_profile: z.string().optional(),
+    style: z.enum(["standard", "fallen_empire"]).optional()
+      .describe("fallen_empire favors a dormant, defensive empire with minimal expansion; it changes advice only"),
   },
-  async ({ save_profile }) => {
+  async ({ save_profile, style }) => {
     const effectiveConfig = save_profile
       ? { ...config, saveProfile: save_profile }
       : config;
 
-    const { state, source } = await getGameState(effectiveConfig, logWatcher);
+    const { state, source, error } = await getGameState(effectiveConfig, logWatcher);
     if (!state) {
       return {
         content: [
           {
             type: "text" as const,
-            text: "No game data available. Ensure Stellaris is running with autosave enabled, or specify a save_profile.",
+            text: error || "No game data available. Ensure Stellaris is running with autosave enabled, or specify a save_profile.",
           },
         ],
       };
@@ -385,22 +388,33 @@ server.tool(
 
     const formattedState = formatGameState(state, source);
 
+    const dormant = (style ?? config.advisorStyle) === "fallen_empire";
+    const doctrine = dormant ? [
+      "Roleplay a dormant Fallen Empire using the player's normal empire mechanics.",
+      "Maintain the economy, repair losses and defend existing borders. Avoid routine colonization, annexation, claims or offensive wars.",
+      "Prioritize resource solvency, stable planets, research, fleet readiness and reserves. Use measured net monthly deficits to estimate reserve runway; do not invent missing values.",
+      "Identify an awakening trigger only when the snapshot shows invasion, an imminent existential threat or a galactic crisis. Report the evidence and a defensive response.",
+      "Use normal legal game actions. Do not suggest resource grants, instant construction/research or changing country type as routine management.",
+    ] : [];
     const analysis = [
       formattedState,
       "",
       "---",
       "## Instructions for AI Advisor",
       "",
-      "You now have the complete game state. Analyze the situation and provide strategic advice covering:",
+      "This is a dated snapshot. Check source, game version and missing-field diagnostics before recommending actions. Log reports are partial and contain no stable object IDs.",
+      "Analyze the observed data and provide strategic advice covering:",
+      ...doctrine,
       "1. **Economic Assessment** — Are resources balanced? Any critical shortages?",
       "2. **Military Assessment** — Fleet strength relative to neighbors. Vulnerabilities?",
-      "3. **Expansion Opportunities** — Available colonization targets, claims worth pressing?",
+      dormant ? "3. **Territorial Discipline** — Can the existing empire remain stable without expansion?" :
+        "3. **Expansion Opportunities** — Available colonization targets, claims worth pressing?",
       "4. **Diplomatic Landscape** — Threats, potential allies, federation opportunities?",
       "5. **Technology Priorities** — What should be researched next given current situation?",
       "6. **Recommended Actions** — Top 3-5 concrete actions to take this decade.",
       "",
       "If you want to execute actions, use the `execute_command` or `queue_commands` tools.",
-      `The player must then run \`run ai_commands.txt\` in the Stellaris console.`,
+      "The player must run the exact `run <filename>` returned by each tool in the Stellaris console. Writing a batch is not confirmation it was executed.",
     ];
 
     return { content: [{ type: "text" as const, text: analysis.join("\n") }] };
@@ -412,14 +426,14 @@ async function main() {
   // Start watchers
   try {
     await logWatcher.start();
-  } catch {
-    // Log file may not exist yet, that's ok
+  } catch (error) {
+    console.error("Unable to start game-log monitoring:", error);
   }
 
   try {
-    saveWatcher.start();
-  } catch {
-    // Save dir may not exist
+    await saveWatcher.start();
+  } catch (error) {
+    console.error("Unable to start save monitoring:", error);
   }
 
   const transport = new StdioServerTransport();
@@ -430,3 +444,12 @@ main().catch((error) => {
   console.error("Fatal error:", error);
   process.exit(1);
 });
+
+function diagnosticNotice(diagnostics: import("./parser/types.js").GameState["diagnostics"]): string {
+  if (!diagnostics) return "";
+  const messages = [...diagnostics.warnings];
+  if (diagnostics.missingFields.length) {
+    messages.push(`Unavailable fields (numeric defaults are not measurements): ${diagnostics.missingFields.join(", ")}`);
+  }
+  return messages.length ? "\n\nData diagnostics:\n" + messages.map((message) => `- ${message}`).join("\n") : "";
+}

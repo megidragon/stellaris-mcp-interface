@@ -8,7 +8,7 @@ ai_player_dump_fleets = {
 		}
 
 		export_trigger_value_to_variable = {
-			trigger = fleet_size
+			trigger = num_ships
 			variable = ai_fl_ships
 		}
 		export_trigger_value_to_variable = {
@@ -16,6 +16,8 @@ ai_player_dump_fleets = {
 			variable = ai_fl_power
 		}
 
-		log = "AI_FLEET|\\[This.GetName]|\\[This.ai_fl_ships]|\\[This.ai_fl_power]|\\[This.fleet_mia]"
+		# No documented fleet MIA localization/trigger is available. Report it
+		# explicitly as unknown rather than silently treating missing data as no.
+		log = "AI_FLEET|\\[This.GetName]|\\[This.ai_fl_ships]|\\[This.ai_fl_power]|unknown"
 	}
 }
